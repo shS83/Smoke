@@ -4,3 +4,6 @@
 .idea/*
 env
 venv
+build
+build-sanitize
+build2

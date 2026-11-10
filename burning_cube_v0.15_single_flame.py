@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-burning_cube.py v0.2
+burning_cube.py v0.15 single-flame
 
 Ensimmäinen varsinainen fire + smoke -versio.
 
@@ -91,7 +91,7 @@ IGNITION_TEMPERATURE = 0.32
 HEAT_RELEASE = 2.45
 
 # Palamisesta syntyvä smoke density.
-SMOKE_YIELD = 0.24
+SMOKE_YIELD = 0.20
 
 # Polttoaine ei saa kasvaa loputtomasti.
 MAX_FUEL = 2.0
@@ -105,16 +105,16 @@ MAX_TEMPERATURE = 3.2
 # ---------------------------------------------------------------------------
 
 SOURCE_X = SIM_W * 0.5
-SOURCE_Y = SIM_H * 0.82
+SOURCE_Y = SIM_H * 0.89
 
-SOURCE_RADIUS_X = 7.0
-SOURCE_RADIUS_Y = 2.7
+SOURCE_RADIUS_X = 11.5
+SOURCE_RADIUS_Y = 4.4
 
-SOURCE_FUEL_STRENGTH = 4.2
-SOURCE_HEAT_STRENGTH = 5.0
-SOURCE_SMOKE_STRENGTH = 0.10
+SOURCE_FUEL_STRENGTH = 4.9
+SOURCE_HEAT_STRENGTH = 5.8
+SOURCE_SMOKE_STRENGTH = 0.06
 
-SOURCE_UPWARD_SPEED = 10.0
+SOURCE_UPWARD_SPEED = 11.5
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +144,49 @@ FIRE_TEMP_MIN = 0.18
 # Liekin alpha / emissio.
 FIRE_ALPHA_GAIN = 2.05
 FIRE_GLOW_GAIN = 0.72
+
+# ---------------------------------------------------------------------------
+# Burning Cube v0.9: 2D obstacle physics
+# ---------------------------------------------------------------------------
+
+# Kuinka voimakkaasti virtaus työnnetään pois kuution pinnasta.
+OBSTACLE_REPEL = 29.0
+
+# Auttaa kuumaa kaasua liukumaan kuution sivuja pitkin ylöspäin.
+OBSTACLE_LIFT = 17.0
+
+# Kun liekki osuu kuution alapintaan, virtaus jaetaan vasemmalle/oikealle.
+OBSTACLE_SPLIT = 34.0
+
+# Kuution yläreunassa sama fuel muuttuu asteittain savuksi.
+TOP_FUEL_TO_SMOKE = 1.18
+TOP_SMOKE_YIELD = 1.58
+TOP_COOLING = 1.10
+
+# ---------------------------------------------------------------------------
+# v0.10: the cube itself is combustible
+# ---------------------------------------------------------------------------
+
+# Surface needs real flame heat before it starts pyrolysing.
+CUBE_SURFACE_IGNITION_TEMP = 0.28
+
+# How quickly an already burning patch ignites neighbouring cube surface.
+CUBE_SURFACE_SPREAD = 3.8
+
+# Burning cube surface releases fresh fuel into the adjacent fluid.
+CUBE_FUEL_RELEASE = 3.30
+
+# Extra heat released by the burning material.
+CUBE_HEAT_RELEASE = 2.60
+
+# Small smoke yield directly from the burning material.
+CUBE_SMOKE_RELEASE = 0.10
+
+# Makes the flame cling to and climb the burning surface.
+CUBE_FLAME_LIFT = 16.0
+
+# Surface burn decays only very slowly while it remains on the cube.
+CUBE_SURFACE_DECAY = 0.996
 
 # V0.7: kasvatetaan liekin näkyvää aluetta renderöinnissä ilman,
 # että savun tai fluidin fysiikkaa muutetaan.
@@ -302,7 +345,7 @@ SOURCE_MASK = gaussian_blob(
 
 
 # ---------------------------------------------------------------------------
-# Burning Cube v0.2 — screen-space cube ignition masks
+# Burning Cube v0.15 single-flame — screen-space cube ignition masks
 #
 # The 3D cube occupies roughly x=0.30..0.70 and y=0.35..0.74 after
 # projection. These soft masks make the 2D combustion field behave as if
@@ -314,37 +357,37 @@ CUBE_SIM_Y = SIM_H * 0.55
 
 CUBE_CONTACT_MASK = gaussian_blob(
     CUBE_SIM_X,
-    SIM_H * 0.72,
-    13.0,
-    4.5,
+    SIM_H * 0.73,
+    14.0,
+    5.0,
 )
 
 CUBE_LEFT_MASK = gaussian_blob(
-    SIM_W * 0.35,
+    SIM_W * 0.36,
     CUBE_SIM_Y,
-    4.3,
-    22.0,
+    4.6,
+    23.0,
 )
 
 CUBE_RIGHT_MASK = gaussian_blob(
-    SIM_W * 0.65,
+    SIM_W * 0.64,
     CUBE_SIM_Y,
-    4.3,
-    22.0,
+    4.6,
+    23.0,
 )
 
 CUBE_TOP_MASK = gaussian_blob(
     CUBE_SIM_X,
     SIM_H * 0.36,
     18.0,
-    4.0,
+    4.6,
 )
 
 CUBE_BOTTOM_MASK = gaussian_blob(
     CUBE_SIM_X,
     SIM_H * 0.73,
-    17.0,
-    4.3,
+    18.0,
+    4.8,
 )
 
 CUBE_CENTER_MASK = gaussian_blob(
@@ -354,28 +397,76 @@ CUBE_CENTER_MASK = gaussian_blob(
     20.0,
 )
 
+# Basic silhouette used for charring / surface activity.
 CUBE_ENVELOPE_MASK = np.clip(
     CUBE_LEFT_MASK
     + CUBE_RIGHT_MASK
-    + CUBE_TOP_MASK * 0.90
-    + CUBE_BOTTOM_MASK * 0.82
+    + CUBE_TOP_MASK * 0.92
+    + CUBE_BOTTOM_MASK * 0.84
     + CUBE_CENTER_MASK * 0.16,
+    0.0,
+    1.0,
+).astype(np.float32)
+
+# A more unified "flame sheet" source.
+# Instead of several clearly separate sources, this behaves like one flame
+# body that wraps around the cube after the lower part has ignited.
+CUBE_FLAME_CORE_MASK = gaussian_blob(
+    CUBE_SIM_X,
+    CUBE_SIM_Y,
+    16.0,
+    24.0,
+)
+
+CUBE_FLAME_SHEET_MASK = np.clip(
+    CUBE_ENVELOPE_MASK * 0.92
+    + CUBE_FLAME_CORE_MASK * 0.34,
+    0.0,
+    1.0,
+).astype(np.float32)
+
+# Vertical weighting: more energetic/fuel-rich at the bottom, more
+# smoke-prone at the top.
+CUBE_TOPNESS = np.clip(
+    (SIM_H * 0.76 - GRID_Y) / (SIM_H * 0.42),
+    0.0,
+    1.0,
+).astype(np.float32)
+
+CUBE_BOTTOMNESS = (
+    1.0 - CUBE_TOPNESS
+).astype(np.float32)
+
+CUBE_FLAME_SOURCE_MASK = np.clip(
+    CUBE_FLAME_SHEET_MASK
+    * (
+        0.58
+        + CUBE_BOTTOMNESS * 0.52
+    ),
+    0.0,
+    1.0,
+).astype(np.float32)
+
+CUBE_SMOKE_TRANSITION_MASK = np.clip(
+    CUBE_TOP_MASK * 0.90
+    + CUBE_TOPNESS * CUBE_FLAME_SHEET_MASK * 0.42
+    + CUBE_CENTER_MASK * CUBE_TOPNESS * 0.12,
     0.0,
     1.0,
 ).astype(np.float32)
 
 CUBE_TOP_SMOKE_MASK = gaussian_blob(
     CUBE_SIM_X,
-    SIM_H * 0.33,
-    15.0,
-    4.8,
+    SIM_H * 0.31,
+    16.0,
+    5.4,
 )
 
 CUBE_TOP_LIFT_MASK = gaussian_blob(
     CUBE_SIM_X,
-    SIM_H * 0.37,
-    18.0,
-    7.0,
+    SIM_H * 0.36,
+    19.0,
+    7.6,
 )
 
 
@@ -457,6 +548,63 @@ class FireSmokeSimulation:
             dtype=np.float32,
         )
 
+        # v0.9: projected rotating cube acts as a real obstacle
+        # in the 2D fluid field.
+        self.obstacle = np.zeros(
+            shape,
+            dtype=bool,
+        )
+
+        self.obstacle_float = np.zeros(
+            shape,
+            dtype=np.float32,
+        )
+
+        self.obstacle_potential = np.zeros(
+            shape,
+            dtype=np.float32,
+        )
+
+        self.obstacle_nx = np.zeros(
+            shape,
+            dtype=np.float32,
+        )
+
+        self.obstacle_ny = np.zeros(
+            shape,
+            dtype=np.float32,
+        )
+
+        self.obstacle_near = np.zeros(
+            shape,
+            dtype=bool,
+        )
+
+        self.obstacle_bottom_zone = np.zeros(
+            shape,
+            dtype=bool,
+        )
+
+        self.obstacle_top_zone = np.zeros(
+            shape,
+            dtype=bool,
+        )
+
+        # v0.10: how strongly each current projected surface patch burns.
+        # This is NOT a second independent flame effect: it is combustible
+        # material that releases fuel into the same single fluid simulation.
+        self.surface_burn = np.zeros(
+            shape,
+            dtype=np.float32,
+        )
+
+        self.surface_burn_tmp = np.zeros(
+            shape,
+            dtype=np.float32,
+        )
+
+        self.obstacle_center_x = SIM_W * 0.5
+
         self.time = 0.0
 
         self.divergence_rms = 0.0
@@ -465,7 +613,7 @@ class FireSmokeSimulation:
         self.show_fire = True
         self.debug_mode = "normal"
 
-        # Burning Cube v0.2:
+        # Burning Cube v0.15 single-flame:
         # 0 = cube not yet burning, 1 = fully engulfed.
         self.cube_ignition = 0.0
 
@@ -482,6 +630,18 @@ class FireSmokeSimulation:
         self.pressure.fill(0.0)
         self.pressure_tmp.fill(0.0)
         self.curl.fill(0.0)
+
+        self.obstacle.fill(False)
+        self.obstacle_float.fill(0.0)
+        self.obstacle_potential.fill(0.0)
+        self.obstacle_nx.fill(0.0)
+        self.obstacle_ny.fill(0.0)
+        self.obstacle_near.fill(False)
+        self.obstacle_bottom_zone.fill(False)
+        self.obstacle_top_zone.fill(False)
+        self.surface_burn.fill(0.0)
+        self.surface_burn_tmp.fill(0.0)
+        self.obstacle_center_x = SIM_W * 0.5
 
         self.time = 0.0
 
@@ -570,43 +730,238 @@ class FireSmokeSimulation:
             out=self.temperature,
         )
 
+    def set_obstacle(
+        self,
+        mask: np.ndarray,
+    ) -> None:
+        """
+        Set the current projected cube silhouette as a fluid obstacle.
+
+        The mask comes from the actual rotating 3D cube projected into the
+        same 240x135 coordinate system used by the fire simulation.
+        """
+
+        if mask.shape != self.obstacle.shape:
+            raise ValueError(
+                "Obstacle mask has wrong shape"
+            )
+
+        self.obstacle[:, :] = mask
+
+        obs = self.obstacle_float
+        obs[:, :] = mask.astype(
+            np.float32
+        )
+
+        # A tiny one-cell inflation prevents semi-Lagrangian sampling from
+        # leaking through sharp moving edges.
+        inflated = (
+            mask
+            | np.roll(mask, 1, axis=0)
+            | np.roll(mask, -1, axis=0)
+            | np.roll(mask, 1, axis=1)
+            | np.roll(mask, -1, axis=1)
+        )
+
+        inflated[0, :] = False
+        inflated[-1, :] = False
+        inflated[:, 0] = False
+        inflated[:, -1] = False
+
+        self.obstacle[:, :] = inflated
+        obs[:, :] = inflated.astype(
+            np.float32
+        )
+
+        # Build a cheap smooth obstacle potential. Its gradient points
+        # INTO the cube and is used to deflect approaching velocity.
+        potential = self.obstacle_potential
+
+        potential[:, :] = (
+            obs
+            + 0.48
+            * (
+                np.roll(obs, 1, axis=0)
+                + np.roll(obs, -1, axis=0)
+                + np.roll(obs, 1, axis=1)
+                + np.roll(obs, -1, axis=1)
+            )
+            + 0.20
+            * (
+                np.roll(obs, 2, axis=0)
+                + np.roll(obs, -2, axis=0)
+                + np.roll(obs, 2, axis=1)
+                + np.roll(obs, -2, axis=1)
+            )
+        )
+
+        gx = self.obstacle_nx
+        gy = self.obstacle_ny
+
+        gx.fill(0.0)
+        gy.fill(0.0)
+
+        gx[:, 1:-1] = 0.5 * (
+            potential[:, 2:]
+            - potential[:, :-2]
+        )
+
+        gy[1:-1, :] = 0.5 * (
+            potential[2:, :]
+            - potential[:-2, :]
+        )
+
+        magnitude = np.sqrt(
+            gx * gx
+            + gy * gy
+        )
+
+        near = (
+            (~self.obstacle)
+            & (magnitude > 1.0e-5)
+        )
+
+        self.obstacle_near[:, :] = near
+
+        # Keep persistent material ignition attached to the CURRENT
+        # projected surface. A small dilation allows it to survive normal
+        # frame-to-frame rotation without leaving trails behind the cube.
+        surface_keep = (
+            near
+            | np.roll(near, 1, axis=0)
+            | np.roll(near, -1, axis=0)
+            | np.roll(near, 1, axis=1)
+            | np.roll(near, -1, axis=1)
+        )
+
+        self.surface_burn *= surface_keep.astype(
+            np.float32
+        )
+
+        inv = np.zeros_like(
+            magnitude,
+            dtype=np.float32,
+        )
+
+        inv[near] = (
+            1.0
+            / magnitude[near]
+        )
+
+        gx *= inv
+        gy *= inv
+
+        # Fluid cells directly BELOW the projected cube.
+        below = (
+            (~self.obstacle)
+            & np.roll(
+                self.obstacle,
+                1,
+                axis=0,
+            )
+        )
+
+        # Widen contact zone slightly.
+        self.obstacle_bottom_zone[:, :] = (
+            below
+            | np.roll(
+                below,
+                1,
+                axis=0,
+            )
+            | np.roll(
+                below,
+                2,
+                axis=0,
+            )
+        )
+
+        # Fluid cells directly ABOVE the projected cube.
+        above = (
+            (~self.obstacle)
+            & np.roll(
+                self.obstacle,
+                -1,
+                axis=0,
+            )
+        )
+
+        self.obstacle_top_zone[:, :] = (
+            above
+            | np.roll(
+                above,
+                -1,
+                axis=0,
+            )
+            | np.roll(
+                above,
+                -2,
+                axis=0,
+            )
+            | np.roll(
+                above,
+                -3,
+                axis=0,
+            )
+        )
+
+        ys, xs = np.nonzero(
+            self.obstacle
+        )
+
+        if xs.size:
+            self.obstacle_center_x = float(
+                np.mean(xs)
+            )
+
     def update_cube_ignition(
         self,
         dt: float,
     ) -> None:
         """
-        The flame below the cube must first heat the cube's lower region.
-
-        Once contact temperature is high enough the fire spreads over the
-        cube over a few seconds. After ignition has clearly started it
-        continues spreading even if a turbulent frame briefly lowers the
-        contact temperature.
+        The cube starts ignition only when the ONE flame below actually
+        heats fluid cells immediately under the current projected cube.
         """
 
-        weight_sum = float(
-            np.sum(
-                CUBE_CONTACT_MASK
+        contact = self.obstacle_bottom_zone
+
+        count = int(
+            np.count_nonzero(
+                contact
             )
         )
+
+        if count <= 0:
+            return
 
         contact_heat = float(
-            np.sum(
-                self.temperature
-                * CUBE_CONTACT_MASK
-            )
-            / max(
-                weight_sum,
-                1.0e-6,
+            np.mean(
+                self.temperature[
+                    contact
+                ]
             )
         )
 
-        if contact_heat > 0.13:
+        contact_fire = float(
+            np.mean(
+                self.burn[
+                    contact
+                ]
+            )
+        )
+
+        contact_energy = (
+            contact_heat
+            + contact_fire * 0.20
+        )
+
+        if contact_energy > 0.08:
             spread_speed = (
-                0.48
+                0.30
                 + min(
-                    contact_heat,
-                    1.4,
-                ) * 0.18
+                    contact_energy,
+                    1.8,
+                ) * 0.24
             )
 
             self.cube_ignition = min(
@@ -615,121 +970,238 @@ class FireSmokeSimulation:
                 + spread_speed * dt,
             )
 
-        elif self.cube_ignition > 0.12:
-            # Once the surface is properly lit, fire keeps crawling upward.
+        elif self.cube_ignition > 0.18:
             self.cube_ignition = min(
                 1.0,
                 self.cube_ignition
-                + 0.12 * dt,
+                + 0.045 * dt,
             )
 
-    def add_cube_surface_source(
+    def burn_cube_surface(
         self,
         dt: float,
     ) -> None:
         """
-        Once ignited, the cube itself becomes a distributed combustion
-        source around its silhouette.
+        Make the cube itself act as combustible material.
 
-        This is what produces the "enveloped in flames" effect while still
-        using the same 2D fluid solver.
+        Important distinction:
+        - the original flame below is still the ignition source;
+        - the cube does not get a separate rendered flame effect;
+        - heated surface patches RELEASE FUEL into the SAME fluid field.
+
+        Thus the flame physically strengthens while touching the cube,
+        climbs over its projected edges, and dies naturally after leaving
+        the fuel-producing surface.
         """
 
-        ignition = self.cube_ignition
+        surface = self.obstacle_near
 
-        if ignition <= 0.001:
+        if not np.any(surface):
             return
 
-        flicker = (
-            0.86
-            + 0.08
-            * math.sin(
-                self.time * 4.1
-            )
-            + 0.06
-            * math.sin(
-                self.time * 7.3
-                + 1.4
-            )
-        )
-
-        surface = (
-            CUBE_ENVELOPE_MASK
-            * ignition
-            * flicker
-        )
-
-        # Fuel clings to the cube surface.
-        self.fuel += (
-            surface
-            * 1.75
-            * dt
-        )
-
-        # Keep the cube surface hot enough for continuous combustion.
-        self.temperature += (
-            surface
-            * 2.15
-            * dt
-        )
-
-        # Small upward pull around the entire envelope makes flame tongues
-        # climb the sides instead of forming a static halo.
-        self.vy -= (
-            surface
-            * 7.0
-            * dt
-        )
-
-        # Alternating side push makes the envelope roll around the cube.
-        side_wave = (
-            math.sin(
-                self.time * 2.7
-            )
-            * 2.2
-        )
-
-        self.vx += (
+        # Local fire contact ignites only the surface actually being heated.
+        local_heat = np.clip(
             (
-                CUBE_LEFT_MASK
-                - CUBE_RIGHT_MASK
+                self.temperature
+                - CUBE_SURFACE_IGNITION_TEMP
             )
-            * side_wave
-            * ignition
+            / 1.05,
+            0.0,
+            1.0,
+        )
+
+        local_fire = np.clip(
+            self.burn / 1.5,
+            0.0,
+            1.0,
+        )
+
+        contact = np.clip(
+            local_heat
+            + local_fire * 0.48,
+            0.0,
+            1.0,
+        )
+
+        contact *= surface
+
+        burn = self.surface_burn
+
+        # Directly contacted material ignites quickly.
+        burn += (
+            contact
+            * 2.35
             * dt
         )
 
-        # Smoke is intentionally concentrated above the cube rather than
-        # being injected uniformly around every burning side.
-        top_smoke = (
-            CUBE_TOP_SMOKE_MASK
-            * ignition
-            * (
-                0.80
-                + 0.20
-                * math.sin(
-                    self.time * 2.1
-                    + 0.8
+        # Fire spreads over the contiguous projected surface.
+        # Neighbour max gives us an inexpensive surface flame-front.
+        neighbour = self.surface_burn_tmp
+
+        neighbour[:, :] = np.maximum.reduce(
+            (
+                np.roll(burn, 1, axis=0),
+                np.roll(burn, -1, axis=0),
+                np.roll(burn, 1, axis=1),
+                np.roll(burn, -1, axis=1),
+                np.roll(
+                    np.roll(
+                        burn,
+                        1,
+                        axis=0,
+                    ),
+                    1,
+                    axis=1,
+                ),
+                np.roll(
+                    np.roll(
+                        burn,
+                        1,
+                        axis=0,
+                    ),
+                    -1,
+                    axis=1,
+                ),
+                np.roll(
+                    np.roll(
+                        burn,
+                        -1,
+                        axis=0,
+                    ),
+                    1,
+                    axis=1,
+                ),
+                np.roll(
+                    np.roll(
+                        burn,
+                        -1,
+                        axis=0,
+                    ),
+                    -1,
+                    axis=1,
+                ),
+            )
+        )
+
+        # Slight upward preference makes ignition crawl naturally from the
+        # initial lower contact toward the cube's upper edges.
+        upward_seed = np.roll(
+            burn,
+            -1,
+            axis=0,
+        )
+
+        spread_target = np.maximum(
+            neighbour * 0.92,
+            upward_seed,
+        )
+
+        spread_target *= surface
+
+        spread = np.maximum(
+            spread_target
+            - burn,
+            0.0,
+        )
+
+        burn += (
+            spread
+            * CUBE_SURFACE_SPREAD
+            * dt
+        )
+
+        burn *= CUBE_SURFACE_DECAY
+
+        # Burning material must stay attached to the actual cube surface.
+        burn *= surface.astype(
+            np.float32
+        )
+
+        np.clip(
+            burn,
+            0.0,
+            1.0,
+            out=burn,
+        )
+
+        # Global ignition is now simply a useful debug/progress indication.
+        burning_cells = burn[
+            surface
+        ]
+
+        if burning_cells.size:
+            surface_level = float(
+                np.mean(
+                    burning_cells
                 )
             )
+
+            self.cube_ignition = max(
+                self.cube_ignition,
+                min(
+                    1.0,
+                    surface_level * 1.85,
+                ),
+            )
+
+        # ---------------------------------------------------------------
+        # Pyrolysis:
+        # burning solid material emits fuel and heat into adjacent fluid.
+        # ---------------------------------------------------------------
+
+        material_fire = (
+            burn
+            * surface
+        )
+
+        # Stronger fuel production in active flame contact; already-burning
+        # surface continues feeding the flame after the initial contact.
+        contact_boost = (
+            0.72
+            + contact * 0.58
+        )
+
+        released_fuel = (
+            material_fire
+            * contact_boost
+            * CUBE_FUEL_RELEASE
+            * dt
+        )
+
+        self.fuel += released_fuel
+
+        self.temperature += (
+            material_fire
+            * CUBE_HEAT_RELEASE
+            * dt
         )
 
         self.density += (
-            top_smoke
-            * 1.05
+            material_fire
+            * CUBE_SMOKE_RELEASE
             * dt
         )
 
-        self.temperature += (
-            CUBE_TOP_LIFT_MASK
-            * ignition
-            * 0.40
-            * dt
-        )
-
+        # The freshly released hot fuel sticks to the surface long enough
+        # to wrap over the cube instead of immediately peeling away.
         self.vy -= (
-            CUBE_TOP_LIFT_MASK
-            * ignition
+            material_fire
+            * CUBE_FLAME_LIFT
+            * dt
+        )
+
+        # Along the lower half, help the burning material feed the same
+        # left/right split that already deflects the original flame.
+        split_sign = np.sign(
+            GRID_X
+            - self.obstacle_center_x
+        ).astype(
+            np.float32
+        )
+
+        self.vx += (
+            split_sign
+            * material_fire
             * 5.5
             * dt
         )
@@ -747,6 +1219,169 @@ class FireSmokeSimulation:
             MAX_TEMPERATURE,
             out=self.temperature,
         )
+
+    def apply_obstacle_velocity(
+        self,
+        dt: float,
+    ) -> None:
+        """
+        Deflect velocity around the cube instead of letting the flame cross it.
+
+        This is deliberately inexpensive rather than a full solid-aware
+        Navier-Stokes solve, but the important behavior is physical:
+        one flame hits an obstacle, splits around it, climbs its sides and
+        rejoins above it.
+        """
+
+        obs = self.obstacle
+        near = self.obstacle_near
+
+        # Nothing moves inside the solid cube.
+        self.vx[obs] = 0.0
+        self.vy[obs] = 0.0
+
+        if not np.any(near):
+            return
+
+        nx = self.obstacle_nx
+        ny = self.obstacle_ny
+
+        # Positive dot = velocity pointing INTO the obstacle.
+        dot = (
+            self.vx * nx
+            + self.vy * ny
+        )
+
+        approach = np.maximum(
+            dot,
+            0.0,
+        )
+
+        approach *= near
+
+        # Remove the inward normal component -> velocity becomes tangential.
+        self.vx -= (
+            nx
+            * approach
+            * 1.08
+        )
+
+        self.vy -= (
+            ny
+            * approach
+            * 1.08
+        )
+
+        activity = np.clip(
+            self.temperature / 1.2
+            + self.fuel / 1.0
+            + self.density * 0.16
+            + self.surface_burn * 0.55,
+            0.0,
+            1.0,
+        )
+
+        activity *= near
+
+        # Push away from the solid surface.
+        self.vx -= (
+            nx
+            * OBSTACLE_REPEL
+            * activity
+            * dt
+        )
+
+        self.vy -= (
+            ny
+            * OBSTACLE_REPEL
+            * activity
+            * dt
+        )
+
+        # Hot gas naturally wants to climb while touching the cube.
+        self.vy -= (
+            OBSTACLE_LIFT
+            * activity
+            * dt
+        )
+
+        # At the lower face, split the one incoming flame left/right.
+        bottom = self.obstacle_bottom_zone
+
+        split_sign = np.sign(
+            GRID_X
+            - self.obstacle_center_x
+        ).astype(
+            np.float32
+        )
+
+        split_activity = np.clip(
+            self.temperature / 1.0
+            + self.fuel / 0.9,
+            0.0,
+            1.0,
+        )
+
+        self.vx += (
+            split_sign
+            * bottom
+            * split_activity
+            * OBSTACLE_SPLIT
+            * dt
+        )
+
+        self.vy[obs] = 0.0
+        self.vx[obs] = 0.0
+
+    def apply_obstacle_scalars(
+        self,
+        dt: float,
+    ) -> None:
+        """
+        The cube contains no fluid. At its upper edge the remaining hot fuel
+        gradually becomes smoke, giving a continuous fire -> smoke transition.
+        """
+
+        obs = self.obstacle
+
+        self.density[obs] = 0.0
+        self.temperature[obs] = 0.0
+        self.fuel[obs] = 0.0
+        self.burn[obs] = 0.0
+
+        if self.cube_ignition <= 0.001:
+            return
+
+        top = self.obstacle_top_zone
+
+        conversion = np.minimum(
+            self.fuel,
+            top
+            * self.cube_ignition
+            * TOP_FUEL_TO_SMOKE
+            * dt,
+        )
+
+        self.fuel -= conversion
+
+        self.density += (
+            conversion
+            * TOP_SMOKE_YIELD
+        )
+
+        cool = np.clip(
+            top
+            * self.cube_ignition
+            * TOP_COOLING
+            * dt,
+            0.0,
+            0.20,
+        )
+
+        self.temperature *= (
+            1.0 - cool
+        )
+
 
     def add_mouse_source(
         self,
@@ -1065,6 +1700,12 @@ class FireSmokeSimulation:
 
         self.apply_velocity_boundaries()
 
+        # Pressure projection is not fully solid-aware, so enforce the
+        # moving cube boundary again afterwards.
+        self.apply_obstacle_velocity(
+            0.0
+        )
+
         self.compute_divergence()
 
         interior = (
@@ -1272,17 +1913,19 @@ class FireSmokeSimulation:
             dt
         )
 
-        # 2. Heat reaching the lower cube starts surface ignition.
+        # 2. The original lower flame must first reach the cube.
         self.update_cube_ignition(
             dt
         )
 
-        # 3. The burning cube becomes a distributed fuel/heat source.
-        self.add_cube_surface_source(
+        # 3. Once heated, the cube becomes combustible material.
+        # It releases fuel into the SAME fluid field only along the actual
+        # projected surface touched/spread by the fire.
+        self.burn_cube_surface(
             dt
         )
 
-        # 4. Combust after all sources have been injected.
+        # 4. Combust all fuel: original source + fuel released by the cube.
         self.combust(
             dt
         )
@@ -1340,10 +1983,15 @@ class FireSmokeSimulation:
             dt
         )
 
-        # 9. Pressure projection.
+        # 9. The projected rotating cube is now a real flow obstacle.
+        self.apply_obstacle_velocity(
+            dt
+        )
+
+        # 10. Pressure projection.
         self.project_velocity()
 
-        # 10. Advect scalar-kentät samalla velocityllä.
+        # 11. Advect scalar-kentät samalla velocityllä.
         self.density = advect(
             self.density,
             self.vx,
@@ -1375,7 +2023,13 @@ class FireSmokeSimulation:
 
         self.burn *= 0.90
 
-        # 11. Dissipation / cooling.
+        # 12. Remove fluid inside the cube and convert hot fuel to smoke
+        # as it clears the upper edge.
+        self.apply_obstacle_scalars(
+            dt
+        )
+
+        # 13. Dissipation / cooling.
         self.vx *= (
             VELOCITY_DAMPING
         )
@@ -1827,7 +2481,7 @@ class FireSmokeSimulation:
 
 
 # ---------------------------------------------------------------------------
-# Burning Cube v0.2 — ModernGL renderer
+# Burning Cube v0.15 single-flame — ModernGL renderer
 # ---------------------------------------------------------------------------
 
 CUBE_VERTEX_SHADER = """
@@ -1855,9 +2509,77 @@ CUBE_FRAGMENT_SHADER = """
 #version 330
 
 uniform sampler2D face_tex;
-uniform sampler2D density_tex;
+
+in vec3 v_normal;
+in vec2 v_uv;
+
+out vec4 fragColor;
+
+
+void main() {
+    vec3 base = texture(
+        face_tex,
+        v_uv
+    ).rgb;
+
+    vec3 light_dir = normalize(
+        vec3(-0.45, 0.70, 0.65)
+    );
+
+    float diffuse = (
+        0.34
+        + max(
+            dot(
+                normalize(v_normal),
+                light_dir
+            ),
+            0.0
+        ) * 0.66
+    );
+
+    fragColor = vec4(
+        clamp(
+            base * diffuse,
+            0.0,
+            1.0
+        ),
+        1.0
+    );
+}
+"""
+
+
+FLAME_SHELL_VERTEX_SHADER = """
+#version 330
+
+in vec3 in_pos;
+in vec3 in_normal;
+in vec2 in_uv;
+
+uniform mat4 mvp;
+uniform mat4 model;
+
+out vec3 v_normal;
+out vec2 v_uv;
+
+void main() {
+    gl_Position = mvp * vec4(in_pos, 1.0);
+    v_normal = normalize(mat3(model) * in_normal);
+    v_uv = in_uv;
+}
+"""
+
+
+FLAME_SHELL_FRAGMENT_SHADER = """
+#version 330
+
 uniform sampler2D temperature_tex;
+uniform sampler2D fuel_tex;
 uniform sampler2D burn_tex;
+
+uniform float alpha_scale;
+uniform float cube_ignition;
+uniform float simulation_time;
 
 in vec3 v_normal;
 in vec2 v_uv;
@@ -1896,90 +2618,281 @@ vec3 fire_palette(float h) {
 
 
 void main() {
-    vec3 base = texture(
-        face_tex,
-        v_uv
-    ).rgb;
-
-    // Each cube face sees the same live combustion field.
-    // Flip Y because cube UV origin is at the bottom while the
-    // simulation field uses row 0 as the top.
+    // IMPORTANT:
+    // The combustion simulation is screen-space and the cube occupies
+    // only a small central region of it. Sampling the complete 0..1
+    // texture with face UVs made almost the whole shell sample empty
+    // fluid cells in v0.4.
+    //
+    // Map every cube face specifically into the active cube/fire region.
     vec2 sim_uv = vec2(
-        v_uv.x,
-        1.0 - v_uv.y
+        mix(
+            0.29,
+            0.71,
+            v_uv.x
+        ),
+        mix(
+            0.74,
+            0.34,
+            v_uv.y
+        )
     );
 
-    float density = texture(
-        density_tex,
-        sim_uv
-    ).r;
+    vec2 sample_dx = vec2(
+        2.0 / 240.0,
+        0.0
+    );
+
+    vec2 sample_dy = vec2(
+        0.0,
+        2.0 / 135.0
+    );
 
     float temp = texture(
         temperature_tex,
         sim_uv
     ).r;
 
+    temp = max(
+        temp,
+        texture(
+            temperature_tex,
+            sim_uv + sample_dx
+        ).r
+    );
+
+    temp = max(
+        temp,
+        texture(
+            temperature_tex,
+            sim_uv - sample_dx
+        ).r
+    );
+
+    temp = max(
+        temp,
+        texture(
+            temperature_tex,
+            sim_uv + sample_dy
+        ).r
+    );
+
+    temp = max(
+        temp,
+        texture(
+            temperature_tex,
+            sim_uv - sample_dy
+        ).r
+    );
+
+    float fuel = texture(
+        fuel_tex,
+        sim_uv
+    ).r;
+
+    fuel = max(
+        fuel,
+        texture(
+            fuel_tex,
+            sim_uv + sample_dx
+        ).r
+    );
+
+    fuel = max(
+        fuel,
+        texture(
+            fuel_tex,
+            sim_uv - sample_dx
+        ).r
+    );
+
     float burn = texture(
         burn_tex,
         sim_uv
     ).r;
+
+    burn = max(
+        burn,
+        texture(
+            burn_tex,
+            sim_uv + sample_dy
+        ).r
+    );
+
+    burn = max(
+        burn,
+        texture(
+            burn_tex,
+            sim_uv - sample_dy
+        ).r
+    );
 
     float heat = sat(
         (temp - 0.18)
         / (3.2 - 0.18)
     );
 
+    float fuel_term = sat(
+        fuel / 0.9
+    );
+
     float burn_term = sat(
         burn / 1.6
     );
 
-    // Dark char follows the smoke/burn field.
-    float char_amount = sat(
-        density * 0.22
-        + burn_term * 0.42
+    float physical_flame = sat(
+        heat
+        * (
+            fuel_term * 0.72
+            + burn_term * 0.78
+        )
+        * 2.30
     );
 
-    vec3 charred = base * (
-        1.0 - char_amount * 0.72
+    // Shape the fire as a shell following the cube surface.
+    float edge_dist = max(
+        abs(v_uv.x - 0.5),
+        abs(v_uv.y - 0.5)
     );
 
-    // Simple directional lighting so the cube still reads as 3D.
-    vec3 light_dir = normalize(
-        vec3(-0.45, 0.70, 0.65)
+    float edge_ring = smoothstep(
+        0.13,
+        0.46,
+        edge_dist
     );
 
-    float diffuse = (
-        0.34
-        + max(
-            dot(
-                normalize(v_normal),
-                light_dir
-            ),
-            0.0
-        ) * 0.66
-    );
-
-    vec3 color = charred * diffuse;
-
-    // Hot parts of the surface glow red/orange through the texture.
-    float surface_fire = sat(
-        heat * 0.78
-        + burn_term * 0.34
-    );
-
-    vec3 emissive = fire_palette(
-        sat(
-            heat * 0.93
-            + burn_term * 0.14
+    // Slight animated breakup keeps the shell from looking like a
+    // perfectly solid glowing box.
+    float flicker = (
+        0.78
+        + 0.12
+        * sin(
+            simulation_time * 5.1
+            + v_uv.x * 13.0
+            + v_uv.y * 7.0
+        )
+        + 0.10
+        * sin(
+            simulation_time * 8.7
+            - v_uv.x * 9.0
+            + v_uv.y * 15.0
         )
     );
 
-    color += emissive
-        * surface_fire
-        * 0.72;
+    // Once the cube is ignited, maintain a real visible flame envelope.
+    // The live fuel/temperature field still drives most of the variation,
+    // but a turbulent frame can no longer make the shell vanish.
+    float ignition_shell = (
+        cube_ignition
+        * (
+            0.18
+            + edge_ring * 0.62
+        )
+        * (
+            0.50
+            + heat * 0.34
+            + burn_term * 0.16
+        )
+        * flicker
+    );
+
+    float flame = max(
+        physical_flame,
+        ignition_shell
+    );
+
+    // The top still burns, but slightly less strongly because this is
+    // where flame gradually becomes the smoke plume.
+    float top_transition = (
+        1.0
+        - smoothstep(
+            0.76,
+            1.00,
+            v_uv.y
+        ) * 0.20
+    );
+
+    flame *= top_transition;
+    flame *= alpha_scale;
+
+    if (flame < 0.01) {
+        discard;
+    }
+
+    vec3 normal_vec = normalize(v_normal);
+    vec3 viewish_light = normalize(
+        vec3(-0.25, 0.85, 0.55)
+    );
+
+    float facing = (
+        0.40
+        + max(
+            dot(normal_vec, viewish_light),
+            0.0
+        ) * 0.60
+    );
+
+    float palette_heat = sat(
+        heat * 0.98
+        + burn_term * 0.14
+    );
+
+    vec3 fire_rgb = fire_palette(
+        palette_heat
+    );
+
+    // Warm glow around the shell.
+    float glow = sat(
+        (
+            heat * 0.56
+            + burn_term * 0.44
+        ) * 0.78
+    );
+
+    vec3 glow_rgb = vec3(
+        glow,
+        glow * (86.0 / 255.0),
+        glow * (10.0 / 255.0)
+    );
+
+    vec3 color = fire_rgb * facing;
+    color += glow_rgb * 0.42;
 
     fragColor = vec4(
-        clamp(color, 0.0, 1.0),
+        clamp(color, 0.0, 1.0) * flame,
+        flame
+    );
+}
+"""
+
+
+
+CUBE_MASK_VERTEX_SHADER = """
+#version 330
+
+in vec3 in_pos;
+
+uniform mat4 mvp;
+
+void main() {
+    gl_Position = mvp * vec4(
+        in_pos,
+        1.0
+    );
+}
+"""
+
+
+CUBE_MASK_FRAGMENT_SHADER = """
+#version 330
+
+out vec4 fragColor;
+
+void main() {
+    fragColor = vec4(
+        1.0,
+        1.0,
+        1.0,
         1.0
     );
 }
@@ -2041,6 +2954,7 @@ uniform sampler2D density_tex;
 uniform sampler2D temperature_tex;
 uniform sampler2D fuel_tex;
 uniform sampler2D burn_tex;
+uniform sampler2D cube_mask_tex;
 
 uniform vec2 texel_size;
 
@@ -2049,6 +2963,9 @@ uniform int pass_mode;
 uniform bool show_fire;
 uniform bool volumetric_enabled;
 uniform float volumetric_strength;
+uniform float cube_ignition;
+uniform float simulation_time;
+uniform vec4 cube_bounds;
 
 in vec2 v_uv;
 out vec4 fragColor;
@@ -2056,6 +2973,90 @@ out vec4 fragColor;
 
 float sat(float x) {
     return clamp(x, 0.0, 1.0);
+}
+
+
+float hash21(vec2 p) {
+    p = fract(
+        p * vec2(
+            123.34,
+            456.21
+        )
+    );
+
+    p += dot(
+        p,
+        p + 45.32
+    );
+
+    return fract(
+        p.x * p.y
+    );
+}
+
+
+float value_noise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+
+    f = f * f * (
+        3.0 - 2.0 * f
+    );
+
+    float a = hash21(
+        i
+    );
+
+    float b = hash21(
+        i + vec2(1.0, 0.0)
+    );
+
+    float c = hash21(
+        i + vec2(0.0, 1.0)
+    );
+
+    float d = hash21(
+        i + vec2(1.0, 1.0)
+    );
+
+    return mix(
+        mix(a, b, f.x),
+        mix(c, d, f.x),
+        f.y
+    );
+}
+
+
+float flame_noise(vec2 uv) {
+    vec2 p = vec2(
+        uv.x * 7.0,
+        uv.y * 5.2
+        - simulation_time * 1.15
+    );
+
+    float n = 0.0;
+
+    n += value_noise(
+        p
+    ) * 0.55;
+
+    n += value_noise(
+        p * 2.05
+        + vec2(
+            simulation_time * 0.18,
+            4.7
+        )
+    ) * 0.28;
+
+    n += value_noise(
+        p * 4.10
+        - vec2(
+            simulation_time * 0.24,
+            2.1
+        )
+    ) * 0.17;
+
+    return n;
 }
 
 
@@ -2172,6 +3173,682 @@ float expanded_flame(vec2 uv) {
     m = max(m, flame_at(uv + vec2(-t2.x, -t2.y)));
 
     return m;
+}
+
+
+
+float source_flame_energy() {
+    // Sample only the ONE actual flame source below the cube.
+    // These points cover the widened source around x=0.5, y≈0.84.
+    float e = 0.0;
+
+    e = max(
+        e,
+        expanded_flame(
+            vec2(0.50, 0.89)
+        )
+    );
+
+    e = max(
+        e,
+        expanded_flame(
+            vec2(0.46, 0.89)
+        )
+    );
+
+    e = max(
+        e,
+        expanded_flame(
+            vec2(0.54, 0.89)
+        )
+    );
+
+    e = max(
+        e,
+        expanded_flame(
+            vec2(0.50, 0.85)
+        )
+    );
+
+    e = max(
+        e,
+        expanded_flame(
+            vec2(0.43, 0.91)
+        )
+    );
+
+    e = max(
+        e,
+        expanded_flame(
+            vec2(0.57, 0.91)
+        )
+    );
+
+    return sat(e);
+}
+
+
+float pulled_flame_from_below(vec2 uv) {
+    // Sample the same physical flame field at points progressively lower
+    // and closer to the source center. This visually bends the one flame
+    // around the obstacle without creating any new simulation source.
+    float e = 0.0;
+
+    vec2 p1 = vec2(
+        mix(
+            uv.x,
+            0.50,
+            0.38
+        ),
+        min(
+            uv.y + 0.12,
+            0.98
+        )
+    );
+
+    vec2 p2 = vec2(
+        mix(
+            uv.x,
+            0.50,
+            0.56
+        ),
+        min(
+            uv.y + 0.22,
+            0.98
+        )
+    );
+
+    vec2 p3 = vec2(
+        mix(
+            uv.x,
+            0.50,
+            0.72
+        ),
+        min(
+            uv.y + 0.34,
+            0.98
+        )
+    );
+
+    vec2 p4 = vec2(
+        mix(
+            uv.x,
+            0.50,
+            0.86
+        ),
+        min(
+            uv.y + 0.46,
+            0.98
+        )
+    );
+
+    e = max(
+        e,
+        expanded_flame(p1)
+    );
+
+    e = max(
+        e,
+        expanded_flame(p2) * 0.92
+    );
+
+    e = max(
+        e,
+        expanded_flame(p3) * 0.82
+    );
+
+    e = max(
+        e,
+        expanded_flame(p4) * 0.70
+    );
+
+    return sat(e);
+}
+
+
+float cube_mask_at(vec2 uv) {
+    uv = clamp(
+        uv,
+        vec2(0.0),
+        vec2(1.0)
+    );
+
+    return texture(
+        cube_mask_tex,
+        uv
+    ).r;
+}
+
+
+float cube_outer_rim(vec2 uv) {
+    float center = cube_mask_at(
+        uv
+    );
+
+    vec2 t = texel_size;
+
+    float dilated = center;
+
+    // Several rings make a soft but clearly visible flame corridor
+    // outside the projected cube silhouette.
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2( 2.0,  0.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2(-2.0,  0.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2( 0.0,  2.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2( 0.0, -2.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2( 4.0,  0.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2(-4.0,  0.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2( 0.0,  4.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2( 0.0, -4.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2( 6.0,  2.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2(-6.0,  2.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2( 6.0, -2.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2(-6.0, -2.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2( 9.0,  0.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2(-9.0,  0.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2( 0.0,  9.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2( 0.0, -9.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2( 12.0,  4.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2(-12.0,  4.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2( 12.0, -4.0) * t
+        )
+    );
+
+    dilated = max(
+        dilated,
+        cube_mask_at(
+            uv + vec2(-12.0, -4.0) * t
+        )
+    );
+
+    return clamp(
+        dilated - center,
+        0.0,
+        1.0
+    );
+}
+
+
+vec2 engulf_source_uv(
+    vec2 uv,
+    float phase
+) {
+    float left = cube_bounds.x;
+    float right = cube_bounds.y;
+    float top = cube_bounds.z;
+    float bottom = cube_bounds.w;
+
+    float width = max(
+        right - left,
+        0.01
+    );
+
+    float height = max(
+        bottom - top,
+        0.01
+    );
+
+    // Position inside the cube's SCREEN-SPACE bounding rectangle.
+    // This is only for stretching the source flame. No 3D silhouette
+    // information is used.
+    float local_x = sat(
+        (uv.x - left)
+        / width
+    );
+
+    float local_y = sat(
+        (uv.y - top)
+        / height
+    );
+
+    float n = flame_noise(
+        vec2(
+            local_x,
+            local_y
+        )
+        + vec2(
+            phase * 0.13,
+            -phase * 0.08
+        )
+    );
+
+    // Stretch the actual narrow lower flame across the complete cube width.
+    //
+    // left side of cube -> left part of the real flame
+    // right side       -> right part of the real flame
+    //
+    // The sampled source remains narrow in source space; stretching happens
+    // solely because the destination area is much wider.
+    float source_x = mix(
+        0.425,
+        0.575,
+        local_x
+    );
+
+    source_x += (
+        (n - 0.50) * 0.030
+        + sin(
+            simulation_time * 3.1
+            + local_y * 12.0
+            + phase
+        ) * 0.010
+    );
+
+    // Bottom of cube samples the bright base of the source flame.
+    // Top of cube samples the upper flame tongues.
+    float source_y = mix(
+        0.79,
+        0.965,
+        local_y
+    );
+
+    source_y += (
+        (n - 0.50) * 0.018
+        + sin(
+            simulation_time * 3.8
+            + local_x * 16.0
+            + phase * 1.6
+        ) * 0.007
+    );
+
+    return clamp(
+        vec2(
+            source_x,
+            source_y
+        ),
+        vec2(0.0),
+        vec2(1.0)
+    );
+}
+
+
+float stretched_source_flame(
+    vec2 uv,
+    out vec2 hottest_uv
+) {
+    vec2 s0 = engulf_source_uv(
+        uv,
+        0.0
+    );
+
+    vec2 s1 = engulf_source_uv(
+        uv,
+        1.7
+    );
+
+    vec2 s2 = engulf_source_uv(
+        uv,
+        3.4
+    );
+
+    float f0 = expanded_flame(
+        s0
+    );
+
+    float f1 = expanded_flame(
+        s1
+    ) * 0.90;
+
+    float f2 = expanded_flame(
+        s2
+    ) * 0.82;
+
+    float f = f0;
+    hottest_uv = s0;
+
+    if (f1 > f) {
+        f = f1;
+        hottest_uv = s1;
+    }
+
+    if (f2 > f) {
+        f = f2;
+        hottest_uv = s2;
+    }
+
+    return sat(f);
+}
+
+
+float cube_width_region(
+    vec2 uv,
+    float widen
+) {
+    float left = cube_bounds.x;
+    float right = cube_bounds.y;
+
+    float cube_width = max(
+        right - left,
+        0.01
+    );
+
+    float center = (
+        left + right
+    ) * 0.5;
+
+    // Approximate width of the original lower flame in screen UV.
+    float source_half_width = 0.075;
+
+    float cube_half_width = (
+        cube_width * 0.5
+        + cube_width * 0.055
+    );
+
+    float half_width = mix(
+        source_half_width,
+        cube_half_width,
+        sat(widen)
+    );
+
+    float n = flame_noise(
+        vec2(
+            uv.x * 1.7,
+            uv.y * 0.9
+        )
+    );
+
+    // Flame edges remain organic while widening.
+    float edge_warp = (
+        (n - 0.5)
+        * cube_width
+        * 0.035
+        * sat(widen)
+    );
+
+    float soft = mix(
+        0.010,
+        max(
+            cube_width * 0.028,
+            0.007
+        ),
+        sat(widen)
+    );
+
+    float left_edge = (
+        center
+        - half_width
+        + edge_warp
+    );
+
+    float right_edge = (
+        center
+        + half_width
+        + edge_warp
+    );
+
+    float left_mask = smoothstep(
+        left_edge - soft,
+        left_edge + soft,
+        uv.x
+    );
+
+    float right_mask = (
+        1.0
+        - smoothstep(
+            right_edge - soft,
+            right_edge + soft,
+            uv.x
+        )
+    );
+
+    return sat(
+        left_mask * right_mask
+    );
+}
+
+
+float cube_flame_column_region(
+    vec2 uv
+) {
+    float left = cube_bounds.x;
+    float right = cube_bounds.y;
+    float top = cube_bounds.z;
+    float bottom = cube_bounds.w;
+
+    float width = max(
+        right - left,
+        0.01
+    );
+
+    // Allow flame to lick slightly outside the left/right cube edges.
+    float side_margin = (
+        width * 0.055
+    );
+
+    left -= side_margin;
+    right += side_margin;
+
+    float n = flame_noise(
+        vec2(
+            uv.x * 1.4,
+            uv.y * 0.8
+        )
+    );
+
+    // Turbulent side edges so even the maximum width does not form
+    // a clean rectangular boundary.
+    float edge_warp = (
+        (n - 0.5)
+        * width
+        * 0.045
+    );
+
+    float soft = max(
+        width * 0.030,
+        0.006
+    );
+
+    float left_mask = smoothstep(
+        left - soft + edge_warp,
+        left + soft + edge_warp,
+        uv.x
+    );
+
+    float right_mask = (
+        1.0
+        - smoothstep(
+            right - soft + edge_warp,
+            right + soft + edge_warp,
+            uv.x
+        )
+    );
+
+    // Only vertical range matters here. The flame is NOT shaped like the
+    // cube; it is simply a wide 2D flame column passing through it.
+    float bottom_mask = (
+        1.0
+        - smoothstep(
+            bottom + 0.045,
+            bottom + 0.080,
+            uv.y
+        )
+    );
+
+    float top_mask = smoothstep(
+        top - 0.075,
+        top - 0.015,
+        uv.y
+    );
+
+    return sat(
+        left_mask
+        * right_mask
+        * bottom_mask
+        * top_mask
+    );
+}
+
+
+float cube_front_flame_region(vec2 uv) {
+    float body = cube_mask_at(
+        uv
+    );
+
+    float rim = cube_outer_rim(
+        uv
+    );
+
+    // Entire projected cube plus flame licking somewhat beyond its edges.
+    return sat(
+        body
+        + rim * 0.92
+    );
+}
+
+
+float cube_top_connection(vec2 uv) {
+    // Outside the cube, immediately above its current projected top edge.
+    float center = cube_mask_at(
+        uv
+    );
+
+    if (center > 0.5) {
+        return 0.0;
+    }
+
+    vec2 t = texel_size;
+
+    float below = 0.0;
+
+    below = max(
+        below,
+        cube_mask_at(
+            uv + vec2(0.0, 2.0) * t
+        )
+    );
+
+    below = max(
+        below,
+        cube_mask_at(
+            uv + vec2(0.0, 4.0) * t
+        )
+    );
+
+    below = max(
+        below,
+        cube_mask_at(
+            uv + vec2(0.0, 7.0) * t
+        )
+    );
+
+    below = max(
+        below,
+        cube_mask_at(
+            uv + vec2(0.0, 11.0) * t
+        )
+    );
+
+    return below;
 }
 
 
@@ -2426,10 +4103,36 @@ void main() {
         )
     );
 
-    // pass_mode 0 = full background fire/smoke
-    // pass_mode 1 = flames near the cube only, rendered in front
-    if (pass_mode == 1) {
+    // pass_mode 0 = the ONE physical fire/smoke field behind the cube
+    // pass_mode 1 = legacy rim-only flame mode
+    // pass_mode 2 = smoke connection immediately above the cube
+    // pass_mode 3 = ONE widened 2D flame across the whole cube front
+    if (
+        pass_mode == 1
+        || pass_mode == 3
+        || pass_mode == 4
+    ) {
         smoke_alpha = 0.0;
+    }
+
+    if (pass_mode == 2) {
+        float top_connection = cube_top_connection(
+            v_uv
+        );
+
+        float soft_top = smoothstep(
+            0.10,
+            0.90,
+            top_connection
+        );
+
+        smoke_alpha *= (
+            soft_top
+            * (
+                0.30
+                + cube_ignition * 0.34
+            )
+        );
     }
 
     vec3 smoke_flat = flat_smoke_color(
@@ -2458,7 +4161,11 @@ void main() {
 
     float alpha = smoke_alpha;
 
-    if (show_fire) {
+    if (
+        show_fire
+        && pass_mode != 0
+        && pass_mode != 2
+    ) {
         float heat = sat(
             (temp - 0.18)
             / (3.2 - 0.18)
@@ -2467,6 +4174,12 @@ void main() {
         float burn_term = sat(
             burn / 1.6
         );
+
+        // Normally color comes from local heat/burn.
+        // In the silhouette-wrap pass these are replaced with values
+        // derived from the ONE flame source below the cube.
+        float render_heat = heat;
+        float render_burn = burn_term;
 
         float flame_base = flame_at(
             v_uv
@@ -2481,48 +4194,466 @@ void main() {
             + flame_expanded * 0.72
         );
 
-        float front_x = (
-            1.0
-            - smoothstep(
-                0.19,
-                0.29,
-                abs(
-                    v_uv.x - 0.50
+        // Fire naturally loses emissive flame above the cube and becomes
+        // mainly smoke. v_uv.y = 0 is the top of the screen.
+        float upper_flame_fade = smoothstep(
+            0.18,
+            0.36,
+            v_uv.y
+        );
+
+        flame *= upper_flame_fade;
+
+        if (pass_mode == 1) {
+            float rim = cube_outer_rim(
+                v_uv
+            );
+
+            float source_energy = source_flame_energy();
+
+            float pulled_energy = pulled_flame_from_below(
+                v_uv
+            );
+
+            // ONE source only:
+            // the active flame below supplies both energy and color.
+            float wrap_energy = max(
+                pulled_energy,
+                source_energy * 0.66
+            );
+
+            // Ignition progresses from the cube's lower silhouette toward
+            // the top. It no longer appears uniformly around the whole
+            // cube the instant contact happens.
+            float height_from_bottom = sat(
+                (0.80 - v_uv.y)
+                / 0.58
+            );
+
+            float climb_limit = (
+                0.08
+                + cube_ignition * 1.02
+            );
+
+            float ignition_climb = (
+                1.0
+                - smoothstep(
+                    climb_limit,
+                    climb_limit + 0.13,
+                    height_from_bottom
                 )
-            )
-        );
+            );
 
-        float front_y = (
-            1.0
-            - smoothstep(
-                0.20,
-                0.31,
-                abs(
-                    v_uv.y - 0.55
+            // Bottom is strongest; upper edge gradually turns to smoke.
+            float vertical_wrap = mix(
+                0.42,
+                1.00,
+                smoothstep(
+                    0.28,
+                    0.79,
+                    v_uv.y
                 )
+            );
+
+            float lower_contact = smoothstep(
+                0.54,
+                0.84,
+                v_uv.y
+            );
+
+            vertical_wrap *= (
+                0.80
+                + lower_contact * 0.20
+            );
+
+            float flicker = (
+                0.84
+                + 0.09
+                * sin(
+                    simulation_time * 5.3
+                    + v_uv.x * 19.0
+                    + v_uv.y * 6.0
+                )
+                + 0.07
+                * sin(
+                    simulation_time * 8.1
+                    - v_uv.y * 23.0
+                    + v_uv.x * 8.0
+                )
+            );
+
+            float tongue = (
+                0.74
+                + 0.26
+                * sat(
+                    0.5
+                    + 0.5
+                    * sin(
+                        v_uv.x * 31.0
+                        + v_uv.y * 17.0
+                        + simulation_time * 4.7
+                    )
+                )
+            );
+
+            flame = sat(
+                wrap_energy
+                * rim
+                * ignition_climb
+                * vertical_wrap
+                * flicker
+                * tongue
+                * 1.58
+            );
+
+            // CRITICAL v0.8 FIX:
+            // v0.7 used LOCAL heat here. Around the cube rim local heat is
+            // often zero, so fire_rgb became black while alpha remained
+            // non-zero -> a black ghost cube with premultiplied blending.
+            //
+            // Use the actual lower flame's energy for the rim palette.
+            render_heat = sat(
+                0.34
+                + source_energy * 0.58
+                + pulled_energy * 0.18
+            );
+
+            render_burn = sat(
+                0.18
+                + source_energy * 0.42
+            );
+        }
+
+        if (pass_mode == 3) {
+            float region = cube_flame_column_region(
+                v_uv
+            );
+
+            vec2 source_uv;
+
+            // Sample the exact same physical flame that exists below.
+            // It is only stretched horizontally and vertically.
+            float sampled_flame = stretched_source_flame(
+                v_uv,
+                source_uv
+            );
+
+            float left = cube_bounds.x;
+            float right = cube_bounds.y;
+            float top = cube_bounds.z;
+            float bottom = cube_bounds.w;
+
+            float height = max(
+                bottom - top,
+                0.01
+            );
+
+            float local_y = sat(
+                (v_uv.y - top)
+                / height
+            );
+
+            // Ignition grows bottom -> top. At full ignition the 2D flame
+            // simply spans the entire cube height.
+            float height_from_bottom = (
+                1.0 - local_y
+            );
+
+            float climb_limit = (
+                0.08
+                + cube_ignition * 1.12
+            );
+
+            float climb = (
+                1.0
+                - smoothstep(
+                    climb_limit,
+                    climb_limit + 0.16,
+                    height_from_bottom
+                )
+            );
+
+            float n = flame_noise(
+                vec2(
+                    (v_uv.x - left)
+                    / max(right - left, 0.01),
+                    local_y
+                )
+            );
+
+            // Retain open holes and rising tongues from the real flame.
+            float tongue_wave = (
+                0.5
+                + 0.5
+                * sin(
+                    v_uv.x * 33.0
+                    - simulation_time * 5.0
+                    + n * 5.0
+                )
+            );
+
+            float breakup = smoothstep(
+                0.28,
+                0.68,
+                n * 0.58
+                + tongue_wave * 0.42
+            );
+
+            // Strong enough to reach the top, but begins thinning there
+            // so the physical smoke plume can take over.
+            float top_transition = mix(
+                0.72,
+                1.00,
+                smoothstep(
+                    0.18,
+                    0.62,
+                    local_y
+                )
+            );
+
+            flame = clamp(
+                sampled_flame
+                * region
+                * climb
+                * (
+                    0.48
+                    + breakup * 0.52
+                )
+                * top_transition
+                * 1.30,
+                0.0,
+                0.86
+            );
+
+            // Exact colour comes from the same lower-flame sample.
+            float sampled_temp = texture(
+                temperature_tex,
+                source_uv
+            ).r;
+
+            float sampled_burn = texture(
+                burn_tex,
+                source_uv
+            ).r;
+
+            render_heat = clamp(
+                (
+                    sampled_temp - 0.18
+                )
+                / (
+                    3.2 - 0.18
+                ),
+                0.16,
+                0.88
+            );
+
+            render_burn = clamp(
+                sampled_burn / 1.6,
+                0.08,
+                0.74
+            );
+        }
+
+        if (pass_mode == 4) {
+            float left = cube_bounds.x;
+            float right = cube_bounds.y;
+            float top = cube_bounds.z;
+            float bottom = cube_bounds.w;
+
+            float cube_width = max(
+                right - left,
+                0.01
+            );
+
+            float cube_height = max(
+                bottom - top,
+                0.01
+            );
+
+            // ------------------------------------------------------------
+            // ONE FLAME, ONE CONTINUOUS COORDINATE TRANSFORM
+            // ------------------------------------------------------------
+            //
+            // Far below the cube:
+            //     morph = 0 -> source_uv == v_uv
+            //
+            // At the lower cube edge:
+            //     morph grows smoothly
+            //
+            // Through the cube:
+            //     morph = 1 -> the SAME lower flame is stretched to the
+            //     cube width and height.
+            //
+            // There is no second fire texture or second flame source.
+            // ------------------------------------------------------------
+
+            float morph = (
+                1.0
+                - smoothstep(
+                    bottom - 0.035,
+                    bottom + 0.115,
+                    v_uv.y
+                )
+            );
+
+            // Keep full morph while crossing the cube and slightly above it.
+            float above_fade = smoothstep(
+                top - 0.115,
+                top + 0.020,
+                v_uv.y
+            );
+
+            // Local vertical position through the cube.
+            float local_y = sat(
+                (v_uv.y - top)
+                / cube_height
+            );
+
+            // A SINGLE source coordinate. No multi-sample/max copies.
+            vec2 stretched_uv = engulf_source_uv(
+                v_uv,
+                0.0
+            );
+
+            // Exact original fire below, continuously transforming into
+            // the wide version. This removes the visual seam between
+            // "source flame" and "cube flame".
+            vec2 continuous_uv = mix(
+                v_uv,
+                stretched_uv,
+                morph
+            );
+
+            float continuous_flame = expanded_flame(
+                continuous_uv
+            );
+
+            // Width changes continuously with the SAME morph factor.
+            float width_mask = cube_width_region(
+                v_uv,
+                morph
+            );
+
+            // Original narrow fire below should not be clipped by the
+            // cube-width mask before widening starts.
+            float width_gate = mix(
+                1.0,
+                width_mask,
+                morph
+            );
+
+            // Ignition controls only how high the widened part may climb.
+            // It does NOT create another flame.
+            float height_from_bottom = (
+                1.0 - local_y
+            );
+
+            float climb_limit = (
+                0.10
+                + cube_ignition * 1.10
+            );
+
+            float climb = (
+                1.0
+                - smoothstep(
+                    climb_limit,
+                    climb_limit + 0.15,
+                    height_from_bottom
+                )
+            );
+
+            // Below the cube, ignition gating is irrelevant.
+            float ignition_gate = mix(
+                1.0,
+                climb,
+                morph
+            );
+
+            float n = flame_noise(
+                vec2(
+                    (v_uv.x - left)
+                    / cube_width,
+                    v_uv.y
+                )
+            );
+
+            // Gentle domain breakup only; never a second set of tongues.
+            float turbulence = (
+                0.84
+                + 0.16
+                * smoothstep(
+                    0.22,
+                    0.78,
+                    n
+                )
+            );
+
+            // Let flame reach a little beyond the top before smoke wins.
+            float top_exit = mix(
+                1.0,
+                above_fade,
+                morph
+            );
+
+            flame = clamp(
+                continuous_flame
+                * width_gate
+                * ignition_gate
+                * turbulence
+                * top_exit
+                * 1.12,
+                0.0,
+                0.90
+            );
+
+            // Colour comes from the exact SAME continuous sample position.
+            float sampled_temp = texture(
+                temperature_tex,
+                continuous_uv
+            ).r;
+
+            float sampled_burn = texture(
+                burn_tex,
+                continuous_uv
+            ).r;
+
+            render_heat = clamp(
+                (
+                    sampled_temp - 0.18
+                )
+                / (
+                    3.2 - 0.18
+                ),
+                0.10,
+                0.92
+            );
+
+            render_burn = clamp(
+                sampled_burn / 1.6,
+                0.05,
+                0.78
+            );
+        }
+
+        float fire_alpha_scale = (
+            pass_mode == 4
+            ? 0.88
+            : (
+                pass_mode == 3
+                ? 0.76
+                : 0.94
             )
-        );
-
-        float front_mask = (
-            front_x * front_y
-        );
-
-        float pass_scale = (
-            pass_mode == 1
-            ? front_mask * 0.68
-            : 1.0
         );
 
         float fire_alpha = (
             flame
-            * 0.94
-            * pass_scale
+            * fire_alpha_scale
         );
 
         vec3 fire_rgb = fire_palette(
             sat(
-                heat * 0.98
-                + burn_term * 0.14
+                render_heat * 0.98
+                + render_burn * 0.14
             )
         );
 
@@ -2578,8 +4709,8 @@ void main() {
 
         float glow = sat(
             (
-                heat * 0.55
-                + burn_term * 0.45
+                render_heat * 0.55
+                + render_burn * 0.45
             ) * 0.72
         );
 
@@ -2594,24 +4725,85 @@ void main() {
             glow * (10.0 / 255.0)
         );
 
-        float glow_pass = (
-            pass_mode == 1
-            ? front_mask * 0.52
-            : 1.0
-        );
+        float glow_mask = 1.0;
+        float effective_glow_field = glow_field;
+
+        if (pass_mode == 1) {
+            glow_mask = (
+                cube_outer_rim(
+                    v_uv
+                )
+                * cube_ignition
+            );
+
+            effective_glow_field = max(
+                flame,
+                source_flame_energy() * 0.34
+            );
+        }
+
+        float glow_strength = 0.50;
+        float glow_alpha_strength = 0.12;
+
+        if (pass_mode == 3) {
+            glow_mask = (
+                cube_flame_column_region(
+                    v_uv
+                )
+                * smoothstep(
+                    0.06,
+                    0.56,
+                    flame
+                )
+            );
+
+            effective_glow_field = flame;
+
+            glow_strength = 0.15;
+            glow_alpha_strength = 0.028;
+        }
+
+        if (pass_mode == 4) {
+            // The glow is generated from the very same visible flame.
+            // No extra mask, ring, side flame or front flame is added.
+            glow_mask = smoothstep(
+                0.04,
+                0.50,
+                flame
+            );
+
+            effective_glow_field = flame;
+
+            glow_strength = 0.18;
+            glow_alpha_strength = 0.032;
+        }
 
         premul += (
             glow_rgb
-            * glow_field
-            * 0.50
-            * glow_pass
+            * effective_glow_field
+            * glow_strength
+            * glow_mask
         );
 
         alpha = max(
             alpha,
-            glow_field
-            * 0.12
-            * glow_pass
+            effective_glow_field
+            * glow_alpha_strength
+            * glow_mask
+        );
+    }
+
+    if (
+        pass_mode == 3
+        || pass_mode == 4
+    ) {
+        vec3 safe_limit = vec3(
+            max(alpha * 1.85, 0.08)
+        );
+
+        premul = min(
+            premul,
+            safe_limit
         );
     }
 
@@ -2842,6 +5034,137 @@ def create_cube_vertices() -> np.ndarray:
     )
 
 
+
+def rasterize_triangle_into_mask(
+    mask: np.ndarray,
+    points: np.ndarray,
+) -> None:
+    """
+    Rasterize one projected triangle directly into the 240x135 boolean mask.
+    """
+
+    min_x = max(
+        0,
+        int(
+            math.floor(
+                float(
+                    np.min(
+                        points[:, 0]
+                    )
+                )
+            )
+        ),
+    )
+
+    max_x = min(
+        SIM_W - 1,
+        int(
+            math.ceil(
+                float(
+                    np.max(
+                        points[:, 0]
+                    )
+                )
+            )
+        ),
+    )
+
+    min_y = max(
+        0,
+        int(
+            math.floor(
+                float(
+                    np.min(
+                        points[:, 1]
+                    )
+                )
+            )
+        ),
+    )
+
+    max_y = min(
+        SIM_H - 1,
+        int(
+            math.ceil(
+                float(
+                    np.max(
+                        points[:, 1]
+                    )
+                )
+            )
+        ),
+    )
+
+    if (
+        max_x < min_x
+        or max_y < min_y
+    ):
+        return
+
+    x = (
+        GRID_X[
+            min_y:max_y + 1,
+            min_x:max_x + 1,
+        ]
+        + 0.5
+    )
+
+    y = (
+        GRID_Y[
+            min_y:max_y + 1,
+            min_x:max_x + 1,
+        ]
+        + 0.5
+    )
+
+    x0, y0 = points[0]
+    x1, y1 = points[1]
+    x2, y2 = points[2]
+
+    denom = (
+        (y1 - y2)
+        * (x0 - x2)
+        + (x2 - x1)
+        * (y0 - y2)
+    )
+
+    if abs(
+        float(denom)
+    ) < 1.0e-8:
+        return
+
+    a = (
+        (y1 - y2)
+        * (x - x2)
+        + (x2 - x1)
+        * (y - y2)
+    ) / denom
+
+    b = (
+        (y2 - y0)
+        * (x - x2)
+        + (x0 - x2)
+        * (y - y2)
+    ) / denom
+
+    c = (
+        1.0
+        - a
+        - b
+    )
+
+    inside = (
+        (a >= -0.001)
+        & (b >= -0.001)
+        & (c >= -0.001)
+    )
+
+    mask[
+        min_y:max_y + 1,
+        min_x:max_x + 1,
+    ] |= inside
+
+
 def create_edge_vertices() -> np.ndarray:
     vertices = [
         (-1.0, -1.0, -1.0),
@@ -2895,6 +5218,11 @@ class BurningCubeRenderer:
         self.cube_program = self.ctx.program(
             vertex_shader=CUBE_VERTEX_SHADER,
             fragment_shader=CUBE_FRAGMENT_SHADER,
+        )
+
+        self.mask_program = self.ctx.program(
+            vertex_shader=CUBE_MASK_VERTEX_SHADER,
+            fragment_shader=CUBE_MASK_FRAGMENT_SHADER,
         )
 
         self.line_program = self.ctx.program(
@@ -2962,9 +5290,40 @@ class BurningCubeRenderer:
             self._make_scalar_texture()
         )
 
+        # Dynamic projected silhouette of the rotating cube.
+        self.cube_mask_tex = self.ctx.texture(
+            (
+                SIM_W,
+                SIM_H,
+            ),
+            components=1,
+            dtype="f1",
+        )
+
+        self.cube_mask_tex.filter = (
+            moderngl.LINEAR,
+            moderngl.LINEAR,
+        )
+
+        self.cube_mask_tex.repeat_x = False
+        self.cube_mask_tex.repeat_y = False
+
+        self.cube_mask_depth = self.ctx.depth_renderbuffer(
+            (
+                SIM_W,
+                SIM_H,
+            )
+        )
+
+        self.cube_mask_fbo = self.ctx.framebuffer(
+            color_attachments=[
+                self.cube_mask_tex
+            ],
+            depth_attachment=self.cube_mask_depth,
+        )
+
         for program in (
             self.overlay_program,
-            self.cube_program,
         ):
             if "density_tex" in program:
                 program[
@@ -2993,6 +5352,10 @@ class BurningCubeRenderer:
             1.0 / SIM_H,
         )
 
+        self.overlay_program[
+            "cube_mask_tex"
+        ].value = 5
+
         self.density_tex.use(
             location=0
         )
@@ -3007,6 +5370,10 @@ class BurningCubeRenderer:
 
         self.burn_tex.use(
             location=3
+        )
+
+        self.cube_mask_tex.use(
+            location=5
         )
 
     def _load_face_texture(
@@ -3103,6 +5470,12 @@ class BurningCubeRenderer:
             create_cube_vertices()
         )
 
+        self.cube_positions = (
+            cube_vertices
+            .reshape(-1, 8)[:, 0:3]
+            .copy()
+        )
+
         self.cube_vbo = self.ctx.buffer(
             cube_vertices.tobytes()
         )
@@ -3116,6 +5489,29 @@ class BurningCubeRenderer:
                     "in_pos",
                     "in_normal",
                     "in_uv",
+                )
+            ],
+        )
+
+        cube_positions = (
+            cube_vertices
+            .reshape(-1, 8)[:, 0:3]
+            .copy()
+        )
+
+        self.mask_vbo = self.ctx.buffer(
+            cube_positions.astype(
+                np.float32
+            ).tobytes()
+        )
+
+        self.mask_vao = self.ctx.vertex_array(
+            self.mask_program,
+            [
+                (
+                    self.mask_vbo,
+                    "3f",
+                    "in_pos",
                 )
             ],
         )
@@ -3223,6 +5619,121 @@ class BurningCubeRenderer:
             )
         )
 
+        # v0.11:
+        # upload the CURRENT projected cube obstacle as a 2D silhouette.
+        # This drives one unified front-flame pass across the whole cube,
+        # not separate flames on individual faces.
+        cube_mask_u8 = np.ascontiguousarray(
+            simulation.obstacle.astype(
+                np.uint8
+            ) * 255
+        )
+
+        self.cube_mask_tex.write(
+            cube_mask_u8
+        )
+
+    def build_obstacle_mask(
+        self,
+    ) -> np.ndarray:
+        """
+        Project the actual rotating cube into the fire simulation grid.
+
+        No GPU readback and no shader mask are needed. The exact projected
+        3D silhouette becomes a boolean solid obstacle for the fluid.
+        """
+
+        _, mvp = self._matrices()
+
+        positions = self.cube_positions
+
+        ones = np.ones(
+            (
+                positions.shape[0],
+                1,
+            ),
+            dtype=np.float32,
+        )
+
+        hom = np.concatenate(
+            (
+                positions,
+                ones,
+            ),
+            axis=1,
+        )
+
+        clip = (
+            mvp
+            @ hom.T
+        ).T
+
+        w = clip[:, 3]
+
+        safe_w = np.where(
+            np.abs(w) < 1.0e-6,
+            1.0e-6,
+            w,
+        )
+
+        ndc = (
+            clip[:, 0:3]
+            / safe_w[:, None]
+        )
+
+        # NDC -> simulation coordinates.
+        screen_x = (
+            ndc[:, 0] * 0.5
+            + 0.5
+        ) * (
+            SIM_W - 1
+        )
+
+        # Simulation row 0 is top.
+        screen_y = (
+            1.0
+            - (
+                ndc[:, 1] * 0.5
+                + 0.5
+            )
+        ) * (
+            SIM_H - 1
+        )
+
+        projected = np.stack(
+            (
+                screen_x,
+                screen_y,
+            ),
+            axis=1,
+        ).astype(
+            np.float32
+        )
+
+        mask = np.zeros(
+            (
+                SIM_H,
+                SIM_W,
+            ),
+            dtype=bool,
+        )
+
+        # create_cube_vertices() is triangle-expanded: every 3 vertices
+        # already form one face triangle.
+        for i in range(
+            0,
+            projected.shape[0],
+            3,
+        ):
+            rasterize_triangle_into_mask(
+                mask,
+                projected[
+                    i:i + 3
+                ],
+            )
+
+        return mask
+
     def update_rotation(
         self,
         dt: float,
@@ -3264,7 +5775,7 @@ class BurningCubeRenderer:
         model = (
             translation_matrix(
                 0.0,
-                -0.25,
+                -0.20,
                 -5.3,
             )
             @ rotation_y_matrix(
@@ -3274,7 +5785,7 @@ class BurningCubeRenderer:
                 self.angle_x
             )
             @ scale_matrix(
-                0.92
+                0.66
                 * edge_scale
             )
         )
@@ -3298,6 +5809,55 @@ class BurningCubeRenderer:
                 dtype=np.float32,
             ).tobytes()
         )
+
+    def _render_cube_mask(
+        self,
+    ) -> None:
+        """
+        Render the real rotating 3D cube silhouette into a small GPU mask.
+        The 2D flame shader uses this exact projected shape as an obstacle.
+        """
+
+        self.cube_mask_fbo.use()
+
+        self.ctx.viewport = (
+            0,
+            0,
+            SIM_W,
+            SIM_H,
+        )
+
+        self.cube_mask_fbo.clear(
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            depth=1.0,
+        )
+
+        self.ctx.disable(
+            moderngl.BLEND
+        )
+
+        self.ctx.enable(
+            moderngl.DEPTH_TEST
+            | moderngl.CULL_FACE
+        )
+
+        _, mvp = self._matrices()
+
+        self._write_mat4(
+            self.mask_program[
+                "mvp"
+            ],
+            mvp,
+        )
+
+        self.mask_vao.render(
+            mode=moderngl.TRIANGLES
+        )
+
+        self.ctx.screen.use()
 
     def _set_overlay_uniforms(
         self,
@@ -3332,6 +5892,58 @@ class BurningCubeRenderer:
         self.overlay_program[
             "volumetric_strength"
         ].value = volumetric_strength
+
+        self.overlay_program[
+            "cube_ignition"
+        ].value = simulation.cube_ignition
+
+        self.overlay_program[
+            "simulation_time"
+        ].value = simulation.time
+
+        ys, xs = np.nonzero(
+            simulation.obstacle
+        )
+
+        if xs.size:
+            left = float(
+                np.min(xs)
+            ) / float(
+                SIM_W - 1
+            )
+
+            right = float(
+                np.max(xs)
+            ) / float(
+                SIM_W - 1
+            )
+
+            top = float(
+                np.min(ys)
+            ) / float(
+                SIM_H - 1
+            )
+
+            bottom = float(
+                np.max(ys)
+            ) / float(
+                SIM_H - 1
+            )
+
+        else:
+            left = 0.34
+            right = 0.66
+            top = 0.28
+            bottom = 0.75
+
+        self.overlay_program[
+            "cube_bounds"
+        ].value = (
+            left,
+            right,
+            top,
+            bottom,
+        )
 
     def _render_overlay(
         self,
@@ -3375,6 +5987,8 @@ class BurningCubeRenderer:
             pygame.display.get_window_size()
         )
 
+        self.ctx.screen.use()
+
         self.ctx.viewport = (
             0,
             0,
@@ -3390,18 +6004,12 @@ class BurningCubeRenderer:
             depth=1.0,
         )
 
-        # Debug modes stay full-screen and skip the 3D composition.
-        if simulation.debug_mode != "normal":
-            self._render_overlay(
-                simulation,
-                volumetric_enabled,
-                volumetric_strength,
-                pass_mode=0,
-            )
-            return
-
         # --------------------------------------------------------------
-        # 1. Full fire/smoke field BEHIND the cube.
+        # 1. Smoke background only.
+        #
+        # Fire is deliberately suppressed in pass 0. The one and only
+        # visible flame is rendered later in pass 4, continuously from
+        # the original source through the burning cube.
         # --------------------------------------------------------------
         self._render_overlay(
             simulation,
@@ -3410,8 +6018,15 @@ class BurningCubeRenderer:
             pass_mode=0,
         )
 
+        if simulation.debug_mode != "normal":
+            return
+
         # --------------------------------------------------------------
-        # 2. Solid textured cube.
+        # 2. Draw the real 3D cube over the fluid.
+        #
+        # Because the simulation contains no fluid inside the projected
+        # obstacle, flames should naturally be visible only below, beside
+        # and above the cube rather than through its center.
         # --------------------------------------------------------------
         self.ctx.disable(
             moderngl.BLEND
@@ -3422,9 +6037,7 @@ class BurningCubeRenderer:
             | moderngl.CULL_FACE
         )
 
-        model, mvp = (
-            self._matrices()
-        )
+        model, mvp = self._matrices()
 
         self._write_mat4(
             self.cube_program[
@@ -3448,18 +6061,13 @@ class BurningCubeRenderer:
             mode=moderngl.TRIANGLES
         )
 
-        # --------------------------------------------------------------
-        # 3. White edges from the original cube demo.
-        # --------------------------------------------------------------
         if self.show_edges:
             self.ctx.disable(
                 moderngl.CULL_FACE
             )
 
-            _, edge_mvp = (
-                self._matrices(
-                    edge_scale=1.008
-                )
+            _, edge_mvp = self._matrices(
+                edge_scale=1.008
             )
 
             self._write_mat4(
@@ -3479,18 +6087,19 @@ class BurningCubeRenderer:
             )
 
         # --------------------------------------------------------------
-        # 4. A lighter flame-only pass in FRONT of the cube.
+        # 3. THE ONE visible flame.
         #
-        # This gives the illusion that the 2D fire field wraps around
-        # the object: some flames are occluded by the cube, while other
-        # flame tongues cross its front surface.
+        # This pass includes the unchanged original source below the cube.
+        # As that same flame reaches the cube, its sampling coordinates
+        # continuously widen to the cube's screen width. Nothing is added
+        # on top of it; there is no second flame element.
         # --------------------------------------------------------------
         if simulation.show_fire:
             self._render_overlay(
                 simulation,
                 volumetric_enabled,
                 volumetric_strength,
-                pass_mode=1,
+                pass_mode=4,
             )
 
 
@@ -3617,6 +6226,14 @@ def main() -> None:
                     )
 
         if not paused:
+            renderer.update_rotation(
+                dt
+            )
+
+            simulation.set_obstacle(
+                renderer.build_obstacle_mask()
+            )
+
             if pygame.mouse.get_pressed(
                 num_buttons=3
             )[0]:
@@ -3629,9 +6246,10 @@ def main() -> None:
             simulation.step(
                 dt
             )
-
-            renderer.update_rotation(
-                dt
+        else:
+            # Keep the obstacle aligned even after resizing while paused.
+            simulation.set_obstacle(
+                renderer.build_obstacle_mask()
             )
 
         renderer.upload(
@@ -3671,13 +6289,14 @@ def main() -> None:
         )
 
         pygame.display.set_caption(
-            "Burning Cube v0.2"
+            "Burning Cube v0.15 single-flame"
             f"  |  {clock.get_fps():5.1f} FPS"
             f"  |  div {simulation.divergence_rms:.4f}"
             f"  |  curl {simulation.curl_rms:.4f}"
             f"  |  temp {max_temp:.2f}"
             f"  |  fuel {max_fuel:.2f}"
             f"  |  ignition {simulation.cube_ignition * 100.0:4.0f}%"
+            f"  |  surface {float(np.max(simulation.surface_burn)) * 100.0:3.0f}%"
             f"  |  {fire_name}"
             f"  |  {vol_name}"
             + (
